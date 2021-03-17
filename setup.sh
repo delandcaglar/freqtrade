@@ -63,9 +63,9 @@ function updateenv() {
     read -p "Do you want to install dependencies for dev [y/N]? "
     if [[ $REPLY =~ ^[Yy]$ ]]
     then
-        REQUIREMENTS=requirements-dev.txt
+        REQUIREMENTS="-r requirements-dev.txt"
     else
-        REQUIREMENTS=requirements.txt
+        REQUIREMENTS="-r requirements.txt"
     fi
     REQUIREMENTS_HYPEROPT=""
     REQUIREMENTS_PLOT=""
@@ -85,8 +85,8 @@ function updateenv() {
             REQUIREMENTS_HYPEROPT="-r requirements-hyperopt.txt"
         fi
     fi
-
-    ${PYTHON} -m pip install --upgrade -r ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT}
+    echo "burasi mi"
+    ${PYTHON} -m pip install --upgrade ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT}
     if [ $? -ne 0 ]; then
         echo "Failed installing dependencies"
         exit 1
