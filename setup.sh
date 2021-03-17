@@ -86,7 +86,6 @@ function updateenv() {
         fi
     fi
     echo "burasi mi"
-#     echo "${PYTHON} -m pip install --upgrade ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT}"
     ${PYTHON} -m pip install --upgrade ${REQUIREMENTS} ${REQUIREMENTS_HYPEROPT} ${REQUIREMENTS_PLOT}
     if [ $? -ne 0 ]; then
         echo "Failed installing dependencies"
