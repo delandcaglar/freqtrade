@@ -31,11 +31,13 @@ pair = "BTC/USDT"
 ```python
 # Load data using values set above
 from freqtrade.data.history import load_pair_history
+from freqtrade.enums import CandleType
 
 candles = load_pair_history(datadir=data_location,
                             timeframe=config["timeframe"],
                             pair=pair,
                             data_format = "hdf5",
+                            candle_type=CandleType.SPOT,
                             )
 
 # Confirm success
@@ -50,7 +52,9 @@ candles.head()
 ```python
 # Load strategy using values set above
 from freqtrade.resolvers import StrategyResolver
+from freqtrade.data.dataprovider import DataProvider
 strategy = StrategyResolver.load_strategy(config)
+strategy.dp = DataProvider(config, None, None)
 
 # Generate buy/sell signals using strategy
 df = strategy.analyze_ticker(candles, {'pair': pair})
@@ -71,7 +75,7 @@ df.tail()
 
 ```python
 # Report results
-print(f"Generated {df['buy'].sum()} buy signals")
+print(f"Generated {df['enter_long'].sum()} entry signals")
 data = df.set_index('date', drop=False)
 data.tail()
 ```
@@ -127,7 +131,45 @@ print(stats['strategy_comparison'])
 trades = load_backtest_data(backtest_dir)
 
 # Show value-counts per pair
-trades.groupby("pair")["sell_reason"].value_counts()
+trades.groupby("pair")["exit_reason"].value_counts()
+```
+
+## Plotting daily profit / equity line
+
+
+```python
+# Plotting equity line (starting with 0 on day 1 and adding daily profit for each backtested day)
+
+from freqtrade.configuration import Configuration
+from freqtrade.data.btanalysis import load_backtest_data, load_backtest_stats
+import plotly.express as px
+import pandas as pd
+
+# strategy = 'SampleStrategy'
+# config = Configuration.from_files(["user_data/config.json"])
+# backtest_dir = config["user_data_dir"] / "backtest_results"
+
+stats = load_backtest_stats(backtest_dir)
+strategy_stats = stats['strategy'][strategy]
+
+dates = []
+profits = []
+for date_profit in strategy_stats['daily_profit']:
+    dates.append(date_profit[0])
+    profits.append(date_profit[1])
+
+equity = 0
+equity_daily = []
+for daily_profit in profits:
+    equity_daily.append(equity)
+    equity += float(daily_profit)
+
+
+df = pd.DataFrame({'dates': dates,'equity_daily': equity_daily})
+
+fig = px.line(df, x="dates", y="equity_daily")
+fig.show()
+
 ```
 
 ### Load live trading results into a pandas dataframe
@@ -142,7 +184,7 @@ from freqtrade.data.btanalysis import load_trades_from_db
 trades = load_trades_from_db("sqlite:///tradesv3.sqlite")
 
 # Display results
-trades.groupby("pair")["sell_reason"].value_counts()
+trades.groupby("pair")["exit_reason"].value_counts()
 ```
 
 ## Analyze the loaded trades for trade parallelism
@@ -192,6 +234,20 @@ graph = generate_candlestick_graph(pair=pair,
 
 # Render graph in a seperate window
 graph.show(renderer="browser")
+
+```
+
+## Plot average profit per trade as distribution graph
+
+
+```python
+import plotly.figure_factory as ff
+
+hist_data = [trades.profit_ratio]
+group_labels = ['profit_ratio']  # name of the dataset
+
+fig = ff.create_distplot(hist_data, group_labels, bin_size=0.01)
+fig.show()
 
 ```
 

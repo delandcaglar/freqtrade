@@ -1,4 +1,6 @@
+import json
 import re
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock
@@ -7,32 +9,33 @@ from zipfile import ZipFile
 import arrow
 import pytest
 
-from freqtrade.commands import (start_convert_data, start_create_userdir, start_download_data,
-                                start_hyperopt_list, start_hyperopt_show, start_install_ui,
-                                start_list_data, start_list_exchanges, start_list_hyperopts,
-                                start_list_markets, start_list_strategies, start_list_timeframes,
-                                start_new_hyperopt, start_new_strategy, start_show_trades,
-                                start_test_pairlist, start_trading)
+from freqtrade.commands import (start_backtesting_show, start_convert_data, start_convert_trades,
+                                start_create_userdir, start_download_data, start_hyperopt_list,
+                                start_hyperopt_show, start_install_ui, start_list_data,
+                                start_list_exchanges, start_list_markets, start_list_strategies,
+                                start_list_timeframes, start_new_strategy, start_show_trades,
+                                start_test_pairlist, start_trading, start_webserver)
+from freqtrade.commands.db_commands import start_convert_db
 from freqtrade.commands.deploy_commands import (clean_ui_subdir, download_and_install_ui,
                                                 get_ui_download_url, read_ui_version)
 from freqtrade.configuration import setup_utils_configuration
+from freqtrade.enums import RunMode
 from freqtrade.exceptions import OperationalException
-from freqtrade.state import RunMode
-from tests.conftest import (create_mock_trades, get_args, log_has, log_has_re, patch_exchange,
-                            patched_configuration_load_config_file)
+from freqtrade.persistence.models import init_db
+from freqtrade.persistence.pairlock_middleware import PairLocks
+from tests.conftest import (CURRENT_TEST_STRATEGY, create_mock_trades, get_args, log_has,
+                            log_has_re, patch_exchange, patched_configuration_load_config_file)
 from tests.conftest_trades import MOCK_TRADE_COUNT
 
 
 def test_setup_utils_configuration():
     args = [
-        'list-exchanges', '--config', 'config_bittrex.json.example',
+        'list-exchanges', '--config', 'config_examples/config_bittrex.example.json',
     ]
 
     config = setup_utils_configuration(get_args(args), RunMode.OTHER)
     assert "exchange" in config
     assert config['dry_run'] is True
-    assert config['exchange']['key'] == ''
-    assert config['exchange']['secret'] == ''
 
 
 def test_start_trading_fail(mocker, caplog):
@@ -44,7 +47,7 @@ def test_start_trading_fail(mocker, caplog):
     exitmock = mocker.patch("freqtrade.worker.Worker.exit", MagicMock())
     args = [
         'trade',
-        '-c', 'config_bittrex.json.example'
+        '-c', 'config_examples/config_bittrex.example.json'
     ]
     start_trading(get_args(args))
     assert exitmock.call_count == 1
@@ -57,6 +60,18 @@ def test_start_trading_fail(mocker, caplog):
     assert log_has('Fatal exception!', caplog)
 
 
+def test_start_webserver(mocker, caplog):
+
+    api_server_mock = mocker.patch("freqtrade.rpc.api_server.ApiServer", )
+
+    args = [
+        'webserver',
+        '-c', 'config_examples/config_bittrex.example.json'
+    ]
+    start_webserver(get_args(args))
+    assert api_server_mock.call_count == 1
+
+
 def test_list_exchanges(capsys):
 
     args = [
@@ -66,8 +81,8 @@ def test_list_exchanges(capsys):
     start_list_exchanges(get_args(args))
     captured = capsys.readouterr()
     assert re.match(r"Exchanges available for Freqtrade.*", captured.out)
-    assert re.match(r".*binance,.*", captured.out)
-    assert re.match(r".*bittrex,.*", captured.out)
+    assert re.search(r".*binance.*", captured.out)
+    assert re.search(r".*bittrex.*", captured.out)
 
     # Test with --one-column
     args = [
@@ -89,9 +104,9 @@ def test_list_exchanges(capsys):
     start_list_exchanges(get_args(args))
     captured = capsys.readouterr()
     assert re.match(r"All exchanges supported by the ccxt library.*", captured.out)
-    assert re.match(r".*binance,.*", captured.out)
-    assert re.match(r".*bittrex,.*", captured.out)
-    assert re.match(r".*bitmex,.*", captured.out)
+    assert re.search(r".*binance.*", captured.out)
+    assert re.search(r".*bittrex.*", captured.out)
+    assert re.search(r".*bitmex.*", captured.out)
 
     # Test with --one-column --all
     args = [
@@ -116,7 +131,7 @@ def test_list_timeframes(mocker, capsys):
                            '1h': 'hour',
                            '1d': 'day',
                            }
-    patch_exchange(mocker, api_mock=api_mock)
+    patch_exchange(mocker, api_mock=api_mock, id='bittrex')
     args = [
         "list-timeframes",
     ]
@@ -126,10 +141,10 @@ def test_list_timeframes(mocker, capsys):
                        match=r"This command requires a configured exchange.*"):
         start_list_timeframes(pargs)
 
-    # Test with --config config_bittrex.json.example
+    # Test with --config config_examples/config_bittrex.example.json
     args = [
         "list-timeframes",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
     ]
     start_list_timeframes(get_args(args))
     captured = capsys.readouterr()
@@ -173,7 +188,7 @@ def test_list_timeframes(mocker, capsys):
     # Test with --one-column
     args = [
         "list-timeframes",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--one-column",
     ]
     start_list_timeframes(get_args(args))
@@ -197,11 +212,10 @@ def test_list_timeframes(mocker, capsys):
     assert re.search(r"^1d$", captured.out, re.MULTILINE)
 
 
-def test_list_markets(mocker, markets, capsys):
+def test_list_markets(mocker, markets_static, capsys):
 
     api_mock = MagicMock()
-    api_mock.markets = markets
-    patch_exchange(mocker, api_mock=api_mock)
+    patch_exchange(mocker, api_mock=api_mock, id='bittrex', mock_markets=markets_static)
 
     # Test with no --config
     args = [
@@ -213,20 +227,20 @@ def test_list_markets(mocker, markets, capsys):
                        match=r"This command requires a configured exchange.*"):
         start_list_markets(pargs, False)
 
-    # Test with --config config_bittrex.json.example
+    # Test with --config config_examples/config_bittrex.example.json
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--print-list",
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Exchange Bittrex has 10 active markets: "
-            "BLK/BTC, ETH/BTC, ETH/USDT, LTC/BTC, LTC/ETH, LTC/USD, NEO/BTC, "
-            "TKN/BTC, XLTCUSDT, XRP/BTC.\n"
+    assert ("Exchange Bittrex has 12 active markets: "
+            "ADA/USDT:USDT, BLK/BTC, ETH/BTC, ETH/USDT, ETH/USDT:USDT, LTC/BTC, "
+            "LTC/ETH, LTC/USD, NEO/BTC, TKN/BTC, XLTCUSDT, XRP/BTC.\n"
             in captured.out)
 
-    patch_exchange(mocker, api_mock=api_mock, id="binance")
+    patch_exchange(mocker, api_mock=api_mock, id="binance", mock_markets=markets_static)
     # Test with --exchange
     args = [
         "list-markets",
@@ -236,27 +250,27 @@ def test_list_markets(mocker, markets, capsys):
     pargs['config'] = None
     start_list_markets(pargs, False)
     captured = capsys.readouterr()
-    assert re.match("\nExchange Binance has 10 active markets:\n",
+    assert re.match("\nExchange Binance has 12 active markets:\n",
                     captured.out)
 
-    patch_exchange(mocker, api_mock=api_mock, id="bittrex")
+    patch_exchange(mocker, api_mock=api_mock, id="bittrex", mock_markets=markets_static)
     # Test with --all: all markets
     args = [
         "list-markets", "--all",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--print-list",
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Exchange Bittrex has 12 markets: "
-            "BLK/BTC, BTT/BTC, ETH/BTC, ETH/USDT, LTC/BTC, LTC/ETH, LTC/USD, LTC/USDT, NEO/BTC, "
-            "TKN/BTC, XLTCUSDT, XRP/BTC.\n"
+    assert ("Exchange Bittrex has 14 markets: "
+            "ADA/USDT:USDT, BLK/BTC, BTT/BTC, ETH/BTC, ETH/USDT, ETH/USDT:USDT, "
+            "LTC/BTC, LTC/ETH, LTC/USD, LTC/USDT, NEO/BTC, TKN/BTC, XLTCUSDT, XRP/BTC.\n"
             in captured.out)
 
     # Test list-pairs subcommand: active pairs
     args = [
         "list-pairs",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--print-list",
     ]
     start_list_markets(get_args(args), True)
@@ -268,7 +282,7 @@ def test_list_markets(mocker, markets, capsys):
     # Test list-pairs subcommand with --all: all pairs
     args = [
         "list-pairs", "--all",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--print-list",
     ]
     start_list_markets(get_args(args), True)
@@ -281,20 +295,20 @@ def test_list_markets(mocker, markets, capsys):
     # active markets, base=ETH, LTC
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "ETH", "LTC",
         "--print-list",
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Exchange Bittrex has 6 active markets with ETH, LTC as base currencies: "
-            "ETH/BTC, ETH/USDT, LTC/BTC, LTC/ETH, LTC/USD, XLTCUSDT.\n"
+    assert ("Exchange Bittrex has 7 active markets with ETH, LTC as base currencies: "
+            "ETH/BTC, ETH/USDT, ETH/USDT:USDT, LTC/BTC, LTC/ETH, LTC/USD, XLTCUSDT.\n"
             in captured.out)
 
     # active markets, base=LTC
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "LTC",
         "--print-list",
     ]
@@ -307,33 +321,33 @@ def test_list_markets(mocker, markets, capsys):
     # active markets, quote=USDT, USD
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--quote", "USDT", "USD",
         "--print-list",
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Exchange Bittrex has 3 active markets with USDT, USD as quote currencies: "
-            "ETH/USDT, LTC/USD, XLTCUSDT.\n"
+    assert ("Exchange Bittrex has 5 active markets with USDT, USD as quote currencies: "
+            "ADA/USDT:USDT, ETH/USDT, ETH/USDT:USDT, LTC/USD, XLTCUSDT.\n"
             in captured.out)
 
     # active markets, quote=USDT
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--quote", "USDT",
         "--print-list",
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Exchange Bittrex has 2 active markets with USDT as quote currency: "
-            "ETH/USDT, XLTCUSDT.\n"
+    assert ("Exchange Bittrex has 4 active markets with USDT as quote currency: "
+            "ADA/USDT:USDT, ETH/USDT, ETH/USDT:USDT, XLTCUSDT.\n"
             in captured.out)
 
     # active markets, base=LTC, quote=USDT
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "LTC", "--quote", "USDT",
         "--print-list",
     ]
@@ -346,7 +360,7 @@ def test_list_markets(mocker, markets, capsys):
     # active pairs, base=LTC, quote=USDT
     args = [
         "list-pairs",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "LTC", "--quote", "USD",
         "--print-list",
     ]
@@ -359,7 +373,7 @@ def test_list_markets(mocker, markets, capsys):
     # active markets, base=LTC, quote=USDT, NONEXISTENT
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "LTC", "--quote", "USDT", "NONEXISTENT",
         "--print-list",
     ]
@@ -372,7 +386,7 @@ def test_list_markets(mocker, markets, capsys):
     # active markets, base=LTC, quote=NONEXISTENT
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "LTC", "--quote", "NONEXISTENT",
         "--print-list",
     ]
@@ -385,17 +399,17 @@ def test_list_markets(mocker, markets, capsys):
     # Test tabular output
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Exchange Bittrex has 10 active markets:\n"
+    assert ("Exchange Bittrex has 12 active markets:\n"
             in captured.out)
 
     # Test tabular output, no markets found
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--base", "LTC", "--quote", "NONEXISTENT",
     ]
     start_list_markets(get_args(args), False)
@@ -407,31 +421,31 @@ def test_list_markets(mocker, markets, capsys):
     # Test --print-json
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--print-json"
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ('["BLK/BTC","ETH/BTC","ETH/USDT","LTC/BTC","LTC/ETH","LTC/USD","NEO/BTC",'
-            '"TKN/BTC","XLTCUSDT","XRP/BTC"]'
+    assert ('["ADA/USDT:USDT","BLK/BTC","ETH/BTC","ETH/USDT","ETH/USDT:USDT",'
+            '"LTC/BTC","LTC/ETH","LTC/USD","NEO/BTC","TKN/BTC","XLTCUSDT","XRP/BTC"]'
             in captured.out)
 
     # Test --print-csv
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--print-csv"
     ]
     start_list_markets(get_args(args), False)
     captured = capsys.readouterr()
-    assert ("Id,Symbol,Base,Quote,Active,Is pair" in captured.out)
-    assert ("blkbtc,BLK/BTC,BLK,BTC,True,True" in captured.out)
-    assert ("USD-LTC,LTC/USD,LTC,USD,True,True" in captured.out)
+    assert ("Id,Symbol,Base,Quote,Active,Spot,Margin,Future,Leverage" in captured.out)
+    assert ("blkbtc,BLK/BTC,BLK,BTC,True,Spot" in captured.out)
+    assert ("USD-LTC,LTC/USD,LTC,USD,True,Spot" in captured.out)
 
     # Test --one-column
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--one-column"
     ]
     start_list_markets(get_args(args), False)
@@ -443,7 +457,7 @@ def test_list_markets(mocker, markets, capsys):
     # Test --one-column
     args = [
         "list-markets",
-        '--config', 'config_bittrex.json.example',
+        '--config', 'config_examples/config_bittrex.example.json',
         "--one-column"
     ]
     with pytest.raises(OperationalException, match=r"Cannot get markets.*"):
@@ -497,17 +511,6 @@ def test_start_new_strategy(mocker, caplog):
         start_new_strategy(get_args(args))
 
 
-def test_start_new_strategy_DefaultStrat(mocker, caplog):
-    args = [
-        "new-strategy",
-        "--strategy",
-        "DefaultStrategy"
-    ]
-    with pytest.raises(OperationalException,
-                       match=r"DefaultStrategy is not allowed as name\."):
-        start_new_strategy(get_args(args))
-
-
 def test_start_new_strategy_no_arg(mocker, caplog):
     args = [
         "new-strategy",
@@ -515,48 +518,6 @@ def test_start_new_strategy_no_arg(mocker, caplog):
     with pytest.raises(OperationalException,
                        match="`new-strategy` requires --strategy to be set."):
         start_new_strategy(get_args(args))
-
-
-def test_start_new_hyperopt(mocker, caplog):
-    wt_mock = mocker.patch.object(Path, "write_text", MagicMock())
-    mocker.patch.object(Path, "exists", MagicMock(return_value=False))
-
-    args = [
-        "new-hyperopt",
-        "--hyperopt",
-        "CoolNewhyperopt"
-    ]
-    start_new_hyperopt(get_args(args))
-
-    assert wt_mock.call_count == 1
-    assert "CoolNewhyperopt" in wt_mock.call_args_list[0][0][0]
-    assert log_has_re("Writing hyperopt to .*", caplog)
-
-    mocker.patch('freqtrade.commands.deploy_commands.setup_utils_configuration')
-    mocker.patch.object(Path, "exists", MagicMock(return_value=True))
-    with pytest.raises(OperationalException,
-                       match=r".* already exists. Please choose another Hyperopt Name\."):
-        start_new_hyperopt(get_args(args))
-
-
-def test_start_new_hyperopt_DefaultHyperopt(mocker, caplog):
-    args = [
-        "new-hyperopt",
-        "--hyperopt",
-        "DefaultHyperopt"
-    ]
-    with pytest.raises(OperationalException,
-                       match=r"DefaultHyperopt is not allowed as name\."):
-        start_new_hyperopt(get_args(args))
-
-
-def test_start_new_hyperopt_no_arg(mocker):
-    args = [
-        "new-hyperopt",
-    ]
-    with pytest.raises(OperationalException,
-                       match="`new-hyperopt` requires --hyperopt to be set."):
-        start_new_hyperopt(get_args(args))
 
 
 def test_start_install_ui(mocker):
@@ -648,16 +609,33 @@ def test_get_ui_download_url(mocker):
 def test_get_ui_download_url_direct(mocker):
     response = MagicMock()
     response.json = MagicMock(
-        side_effect=[[{
-            'assets_url': 'http://whatever.json',
-            'name': '0.0.1',
-            'assets': [{'browser_download_url': 'http://download11.zip'}]}]])
+        return_value=[
+            {
+                'assets_url': 'http://whatever.json',
+                'name': '0.0.2',
+                'assets': [{'browser_download_url': 'http://download22.zip'}]
+            },
+            {
+                'assets_url': 'http://whatever.json',
+                'name': '0.0.1',
+                'assets': [{'browser_download_url': 'http://download1.zip'}]
+            },
+        ])
     get_mock = mocker.patch("freqtrade.commands.deploy_commands.requests.get",
                             return_value=response)
     x, last_version = get_ui_download_url()
     assert get_mock.call_count == 1
+    assert last_version == '0.0.2'
+    assert x == 'http://download22.zip'
+    get_mock.reset_mock()
+    response.json.reset_mock()
+
+    x, last_version = get_ui_download_url('0.0.1')
     assert last_version == '0.0.1'
-    assert x == 'http://download11.zip'
+    assert x == 'http://download1.zip'
+
+    with pytest.raises(ValueError, match="UI-Version not found."):
+        x, last_version = get_ui_download_url('0.0.3')
 
 
 def test_download_data_keyboardInterrupt(mocker, caplog, markets):
@@ -780,6 +758,46 @@ def test_download_data_no_pairs(mocker, caplog):
         start_download_data(pargs)
 
 
+def test_download_data_all_pairs(mocker, markets):
+
+    mocker.patch.object(Path, "exists", MagicMock(return_value=False))
+
+    dl_mock = mocker.patch('freqtrade.commands.data_commands.refresh_backtest_ohlcv_data',
+                           MagicMock(return_value=["ETH/BTC", "XRP/BTC"]))
+    patch_exchange(mocker)
+    mocker.patch(
+        'freqtrade.exchange.Exchange.markets', PropertyMock(return_value=markets)
+    )
+    args = [
+        "download-data",
+        "--exchange",
+        "binance",
+        "--pairs",
+        ".*/USDT"
+    ]
+    pargs = get_args(args)
+    pargs['config'] = None
+    start_download_data(pargs)
+    expected = set(['ETH/USDT', 'XRP/USDT', 'NEO/USDT', 'TKN/USDT'])
+    assert set(dl_mock.call_args_list[0][1]['pairs']) == expected
+    assert dl_mock.call_count == 1
+
+    dl_mock.reset_mock()
+    args = [
+        "download-data",
+        "--exchange",
+        "binance",
+        "--pairs",
+        ".*/USDT",
+        "--include-inactive-pairs",
+    ]
+    pargs = get_args(args)
+    pargs['config'] = None
+    start_download_data(pargs)
+    expected = set(['ETH/USDT', 'LTC/USDT', 'XRP/USDT', 'NEO/USDT', 'TKN/USDT'])
+    assert set(dl_mock.call_args_list[0][1]['pairs']) == expected
+
+
 def test_download_data_trades(mocker, caplog):
     dl_mock = mocker.patch('freqtrade.commands.data_commands.refresh_backtest_trades_data',
                            MagicMock(return_value=[]))
@@ -796,13 +814,61 @@ def test_download_data_trades(mocker, caplog):
         "--days", "20",
         "--dl-trades"
     ]
-    start_download_data(get_args(args))
+    pargs = get_args(args)
+    pargs['config'] = None
+    start_download_data(pargs)
     assert dl_mock.call_args[1]['timerange'].starttype == "date"
     assert dl_mock.call_count == 1
     assert convert_mock.call_count == 1
+    args = [
+        "download-data",
+        "--exchange", "kraken",
+        "--pairs", "ETH/BTC", "XRP/BTC",
+        "--days", "20",
+        "--trading-mode", "futures",
+        "--dl-trades"
+    ]
+    with pytest.raises(OperationalException,
+                       match="Trade download not supported for futures."):
+        pargs = get_args(args)
+        pargs['config'] = None
+        start_download_data(pargs)
 
 
-def test_start_list_strategies(mocker, caplog, capsys):
+def test_download_data_data_invalid(mocker):
+    patch_exchange(mocker, id="kraken")
+    mocker.patch(
+        'freqtrade.exchange.Exchange.markets', PropertyMock(return_value={})
+    )
+    args = [
+        "download-data",
+        "--exchange", "kraken",
+        "--pairs", "ETH/BTC", "XRP/BTC",
+        "--days", "20",
+    ]
+    pargs = get_args(args)
+    pargs['config'] = None
+    with pytest.raises(OperationalException, match=r"Historic klines not available for .*"):
+        start_download_data(pargs)
+
+
+def test_start_convert_trades(mocker, caplog):
+    convert_mock = mocker.patch('freqtrade.commands.data_commands.convert_trades_to_ohlcv',
+                                MagicMock(return_value=[]))
+    patch_exchange(mocker)
+    mocker.patch(
+        'freqtrade.exchange.Exchange.markets', PropertyMock(return_value={})
+    )
+    args = [
+        "trades-to-ohlcv",
+        "--exchange", "kraken",
+        "--pairs", "ETH/BTC", "XRP/BTC",
+    ]
+    start_convert_trades(get_args(args))
+    assert convert_mock.call_count == 1
+
+
+def test_start_list_strategies(capsys):
 
     args = [
         "list-strategies",
@@ -814,9 +880,9 @@ def test_start_list_strategies(mocker, caplog, capsys):
     # pargs['config'] = None
     start_list_strategies(pargs)
     captured = capsys.readouterr()
-    assert "TestStrategyLegacy" in captured.out
-    assert "legacy_strategy.py" not in captured.out
-    assert "DefaultStrategy" in captured.out
+    assert "StrategyTestV2" in captured.out
+    assert "strategy_test_v2.py" not in captured.out
+    assert CURRENT_TEST_STRATEGY in captured.out
 
     # Test regular output
     args = [
@@ -829,41 +895,44 @@ def test_start_list_strategies(mocker, caplog, capsys):
     # pargs['config'] = None
     start_list_strategies(pargs)
     captured = capsys.readouterr()
-    assert "TestStrategyLegacy" in captured.out
-    assert "legacy_strategy.py" in captured.out
-    assert "DefaultStrategy" in captured.out
+    assert "StrategyTestV2" in captured.out
+    assert "strategy_test_v2.py" in captured.out
+    assert CURRENT_TEST_STRATEGY in captured.out
 
-
-def test_start_list_hyperopts(mocker, caplog, capsys):
-
+    # Test color output
     args = [
-        "list-hyperopts",
-        "--hyperopt-path",
-        str(Path(__file__).parent.parent / "optimize" / "hyperopts"),
-        "-1"
+        "list-strategies",
+        "--strategy-path",
+        str(Path(__file__).parent.parent / "strategy" / "strats"),
     ]
     pargs = get_args(args)
     # pargs['config'] = None
-    start_list_hyperopts(pargs)
+    start_list_strategies(pargs)
     captured = capsys.readouterr()
-    assert "TestHyperoptLegacy" not in captured.out
-    assert "legacy_hyperopt.py" not in captured.out
-    assert "DefaultHyperOpt" in captured.out
-    assert "test_hyperopt.py" not in captured.out
+    assert "StrategyTestV2" in captured.out
+    assert "strategy_test_v2.py" in captured.out
+    assert CURRENT_TEST_STRATEGY in captured.out
+    assert "LOAD FAILED" in captured.out
+    # Recursive
+    assert "TestStrategyNoImplements" not in captured.out
 
-    # Test regular output
+    # Test recursive
     args = [
-        "list-hyperopts",
-        "--hyperopt-path",
-        str(Path(__file__).parent.parent / "optimize" / "hyperopts"),
+        "list-strategies",
+        "--strategy-path",
+        str(Path(__file__).parent.parent / "strategy" / "strats"),
+        '--no-color',
+        '--recursive-strategy-search'
     ]
     pargs = get_args(args)
     # pargs['config'] = None
-    start_list_hyperopts(pargs)
+    start_list_strategies(pargs)
     captured = capsys.readouterr()
-    assert "TestHyperoptLegacy" not in captured.out
-    assert "legacy_hyperopt.py" not in captured.out
-    assert "DefaultHyperOpt" in captured.out
+    assert "StrategyTestV2" in captured.out
+    assert "strategy_test_v2.py" in captured.out
+    assert "StrategyTestV2" in captured.out
+    assert "TestStrategyNoImplements" in captured.out
+    assert str(Path("broken_strats/broken_futures_strategies.py")) in captured.out
 
 
 def test_start_test_pairlist(mocker, caplog, tickers, default_conf, capsys):
@@ -886,7 +955,7 @@ def test_start_test_pairlist(mocker, caplog, tickers, default_conf, capsys):
     patched_configuration_load_config_file(mocker, default_conf)
     args = [
         'test-pairlist',
-        '-c', 'config_bittrex.json.example'
+        '-c', 'config_examples/config_bittrex.example.json'
     ]
 
     start_test_pairlist(get_args(args))
@@ -900,7 +969,7 @@ def test_start_test_pairlist(mocker, caplog, tickers, default_conf, capsys):
 
     args = [
         'test-pairlist',
-        '-c', 'config_bittrex.json.example',
+        '-c', 'config_examples/config_bittrex.example.json',
         '--one-column',
     ]
     start_test_pairlist(get_args(args))
@@ -909,19 +978,35 @@ def test_start_test_pairlist(mocker, caplog, tickers, default_conf, capsys):
 
     args = [
         'test-pairlist',
-        '-c', 'config_bittrex.json.example',
+        '-c', 'config_examples/config_bittrex.example.json',
         '--print-json',
     ]
     start_test_pairlist(get_args(args))
     captured = capsys.readouterr()
-    assert re.match(r'Pairs for BTC: \n\["ETH/BTC","TKN/BTC","BLK/BTC","LTC/BTC","XRP/BTC"\]\n',
-                    captured.out)
+    try:
+        json_pairs = json.loads(captured.out)
+        assert 'ETH/BTC' in json_pairs
+        assert 'TKN/BTC' in json_pairs
+        assert 'BLK/BTC' in json_pairs
+        assert 'LTC/BTC' in json_pairs
+        assert 'XRP/BTC' in json_pairs
+    except json.decoder.JSONDecodeError:
+        pytest.fail(f'Expected well formed JSON, but failed to parse: {captured.out}')
 
 
-def test_hyperopt_list(mocker, capsys, caplog, hyperopt_results):
+def test_hyperopt_list(mocker, capsys, caplog, saved_hyperopt_results, tmpdir):
+    csv_file = Path(tmpdir) / "test.csv"
     mocker.patch(
-        'freqtrade.optimize.hyperopt.Hyperopt.load_previous_results',
-        MagicMock(return_value=hyperopt_results)
+        'freqtrade.optimize.hyperopt_tools.HyperoptTools._test_hyperopt_results_exist',
+        return_value=True
+    )
+
+    def fake_iterator(*args, **kwargs):
+        yield from [saved_hyperopt_results]
+
+    mocker.patch(
+        'freqtrade.optimize.hyperopt_tools.HyperoptTools._read_results',
+        side_effect=fake_iterator
     )
 
     args = [
@@ -1137,24 +1222,35 @@ def test_hyperopt_list(mocker, capsys, caplog, hyperopt_results):
         "hyperopt-list",
         "--no-details",
         "--no-color",
-        "--export-csv", "test_file.csv",
+        "--export-csv",
+        str(csv_file),
     ]
     pargs = get_args(args)
     pargs['config'] = None
     start_hyperopt_list(pargs)
     captured = capsys.readouterr()
     log_has("CSV file created: test_file.csv", caplog)
-    f = Path("test_file.csv")
-    assert 'Best,1,2,-1.25%,-1.2222,-0.00125625,,-2.51,"3,930.0 m",0.43662' in f.read_text()
-    assert f.is_file()
-    f.unlink()
+    assert csv_file.is_file()
+    line = csv_file.read_text()
+    assert ('Best,1,2,-1.25%,-1.2222,-0.00125625,,-2.51,"3,930.0 m",0.43662' in line
+            or "Best,1,2,-1.25%,-1.2222,-0.00125625,,-2.51,2 days 17:30:00,0.43662" in line)
+    csv_file.unlink()
 
 
-def test_hyperopt_show(mocker, capsys, hyperopt_results):
+def test_hyperopt_show(mocker, capsys, saved_hyperopt_results):
     mocker.patch(
-        'freqtrade.optimize.hyperopt.Hyperopt.load_previous_results',
-        MagicMock(return_value=hyperopt_results)
+        'freqtrade.optimize.hyperopt_tools.HyperoptTools._test_hyperopt_results_exist',
+        return_value=True
     )
+
+    def fake_iterator(*args, **kwargs):
+        yield from [saved_hyperopt_results]
+
+    mocker.patch(
+        'freqtrade.optimize.hyperopt_tools.HyperoptTools._read_results',
+        side_effect=fake_iterator
+    )
+    mocker.patch('freqtrade.commands.hyperopt_commands.show_backtest_result')
 
     args = [
         "hyperopt-show",
@@ -1287,8 +1383,8 @@ def test_start_list_data(testdatadir, capsys):
     start_list_data(pargs)
     captured = capsys.readouterr()
     assert "Found 17 pair / timeframe combinations." in captured.out
-    assert "\n|         Pair |       Timeframe |\n" in captured.out
-    assert "\n| UNITTEST/BTC | 1m, 5m, 8m, 30m |\n" in captured.out
+    assert "\n|         Pair |       Timeframe |   Type |\n" in captured.out
+    assert "\n| UNITTEST/BTC | 1m, 5m, 8m, 30m |   spot |\n" in captured.out
 
     args = [
         "list-data",
@@ -1303,15 +1399,33 @@ def test_start_list_data(testdatadir, capsys):
     start_list_data(pargs)
     captured = capsys.readouterr()
     assert "Found 2 pair / timeframe combinations." in captured.out
-    assert "\n|    Pair |   Timeframe |\n" in captured.out
+    assert "\n|    Pair |   Timeframe |   Type |\n" in captured.out
     assert "UNITTEST/BTC" not in captured.out
-    assert "\n| XRP/ETH |      1m, 5m |\n" in captured.out
+    assert "\n| XRP/ETH |      1m, 5m |   spot |\n" in captured.out
+
+    args = [
+        "list-data",
+        "--data-format-ohlcv",
+        "json",
+        "--trading-mode", "futures",
+        "--datadir",
+        str(testdatadir),
+    ]
+    pargs = get_args(args)
+    pargs['config'] = None
+    start_list_data(pargs)
+    captured = capsys.readouterr()
+
+    assert "Found 5 pair / timeframe combinations." in captured.out
+    assert "\n|          Pair |   Timeframe |         Type |\n" in captured.out
+    assert "\n|      XRP/USDT |          1h |      futures |\n" in captured.out
+    assert "\n|      XRP/USDT |      1h, 8h |         mark |\n" in captured.out
 
 
 @pytest.mark.usefixtures("init_persistence")
 def test_show_trades(mocker, fee, capsys, caplog):
     mocker.patch("freqtrade.persistence.init_db")
-    create_mock_trades(fee)
+    create_mock_trades(fee, False)
     args = [
         "show-trades",
         "--db-url",
@@ -1349,3 +1463,49 @@ def test_show_trades(mocker, fee, capsys, caplog):
 
     with pytest.raises(OperationalException, match=r"--db-url is required for this command."):
         start_show_trades(pargs)
+
+
+def test_backtesting_show(mocker, testdatadir, capsys):
+    sbr = mocker.patch('freqtrade.optimize.optimize_reports.show_backtest_results')
+    args = [
+        "backtesting-show",
+        "--export-filename",
+        f"{testdatadir / 'backtest_results/backtest-result_new.json'}",
+        "--show-pair-list"
+    ]
+    pargs = get_args(args)
+    pargs['config'] = None
+    start_backtesting_show(pargs)
+    assert sbr.call_count == 1
+    out, err = capsys.readouterr()
+    assert "Pairs for Strategy" in out
+
+
+def test_start_convert_db(mocker, fee, tmpdir, caplog):
+    db_src_file = Path(f"{tmpdir}/db.sqlite")
+    db_from = f"sqlite:///{db_src_file}"
+    db_target_file = Path(f"{tmpdir}/db_target.sqlite")
+    db_to = f"sqlite:///{db_target_file}"
+    args = [
+        "convert-db",
+        "--db-url-from",
+        db_from,
+        "--db-url",
+        db_to,
+    ]
+
+    assert not db_src_file.is_file()
+    init_db(db_from)
+
+    create_mock_trades(fee)
+
+    PairLocks.timeframe = '5m'
+    PairLocks.lock_pair('XRP/USDT', datetime.now(), 'Random reason 125', side='long')
+    assert db_src_file.is_file()
+    assert not db_target_file.is_file()
+
+    pargs = get_args(args)
+    pargs['config'] = None
+    start_convert_db(pargs)
+
+    assert db_target_file.is_file()

@@ -6,8 +6,9 @@ import logging
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, List
 from typing.io import IO
+from urllib.parse import urlparse
 
 import rapidjson
 
@@ -26,18 +27,23 @@ def decimals_per_coin(coin: str):
     return DECIMALS_PER_COIN.get(coin, DECIMAL_PER_COIN_FALLBACK)
 
 
-def round_coin_value(value: float, coin: str, show_coin_name=True) -> str:
+def round_coin_value(
+        value: float, coin: str, show_coin_name=True, keep_trailing_zeros=False) -> str:
     """
     Get price value for this coin
     :param value: Value to be printed
     :param coin: Which coin are we printing the price / value for
     :param show_coin_name: Return string in format: "222.22 USDT" or "222.22"
+    :param keep_trailing_zeros: Keep trailing zeros "222.200" vs. "222.2"
     :return: Formatted / rounded value (with or without coin name)
     """
+    val = f"{value:.{decimals_per_coin(coin)}f}"
+    if not keep_trailing_zeros:
+        val = val.rstrip('0').rstrip('.')
     if show_coin_name:
-        return f"{value:.{decimals_per_coin(coin)}f} {coin}"
-    else:
-        return f"{value:.{decimals_per_coin(coin)}f}"
+        val = f"{val} {coin}"
+
+    return val
 
 
 def shorten_date(_date: str) -> str:
@@ -56,6 +62,7 @@ def file_dump_json(filename: Path, data: Any, is_zip: bool = False, log: bool = 
     """
     Dump JSON data into a file
     :param filename: file to create
+    :param is_zip: if file should be zip
     :param data: JSON Data to save
     :return:
     """
@@ -77,11 +84,27 @@ def file_dump_json(filename: Path, data: Any, is_zip: bool = False, log: bool = 
     logger.debug(f'done json to "{filename}"')
 
 
+def file_dump_joblib(filename: Path, data: Any, log: bool = True) -> None:
+    """
+    Dump object data into a file
+    :param filename: file to create
+    :param data: Object data to save
+    :return:
+    """
+    import joblib
+
+    if log:
+        logger.info(f'dumping joblib to "{filename}"')
+    with open(filename, 'wb') as fp:
+        joblib.dump(data, fp)
+    logger.debug(f'done joblib dump to "{filename}"')
+
+
 def json_load(datafile: IO) -> Any:
     """
     load data with rapidjson
     Use this to have a consistent experience,
-    sete number_mode to "NM_NATIVE" for greatest speed
+    set number_mode to "NM_NATIVE" for greatest speed
     """
     return rapidjson.load(datafile, number_mode=rapidjson.NM_NATIVE)
 
@@ -107,7 +130,7 @@ def file_load_json(file):
 
 
 def pair_to_filename(pair: str) -> str:
-    for ch in ['/', '-', ' ', '.', '@', '$', '+', ':']:
+    for ch in ['/', ' ', '.', '@', '$', '+', ':']:
         pair = pair.replace(ch, '_')
     return pair
 
@@ -117,10 +140,10 @@ def format_ms_time(date: int) -> str:
     convert MS date to readable format.
     : epoch-string in ms
     """
-    return datetime.fromtimestamp(date/1000.0).strftime('%Y-%m-%dT%H:%M:%S')
+    return datetime.fromtimestamp(date / 1000.0).strftime('%Y-%m-%dT%H:%M:%S')
 
 
-def deep_merge_dicts(source, destination):
+def deep_merge_dicts(source, destination, allow_null_overrides: bool = True):
     """
     Values from Source override destination, destination is returned (and modified!!)
     Sample:
@@ -133,8 +156,8 @@ def deep_merge_dicts(source, destination):
         if isinstance(value, dict):
             # get node or create one
             node = destination.setdefault(key, {})
-            deep_merge_dicts(value, node)
-        else:
+            deep_merge_dicts(value, node, allow_null_overrides)
+        elif value is not None or allow_null_overrides:
             destination[key] = value
 
     return destination
@@ -202,3 +225,27 @@ def render_template_with_fallback(templatefile: str, templatefallbackfile: str,
         return render_template(templatefile, arguments)
     except TemplateNotFound:
         return render_template(templatefallbackfile, arguments)
+
+
+def chunks(lst: List[Any], n: int) -> Iterator[List[Any]]:
+    """
+    Split lst into chunks of the size n.
+    :param lst: list to split into chunks
+    :param n: number of max elements per chunk
+    :return: None
+    """
+    for chunk in range(0, len(lst), n):
+        yield (lst[chunk:chunk + n])
+
+
+def parse_db_uri_for_logging(uri: str):
+    """
+    Helper method to parse the DB URI and return the same DB URI with the password censored
+    if it contains it. Otherwise, return the DB URI unchanged
+    :param uri: DB URI to parse for logging
+    """
+    parsed_db_uri = urlparse(uri)
+    if not parsed_db_uri.netloc:  # No need for censoring as no password was provided
+        return uri
+    pwd = parsed_db_uri.netloc.split(':')[1].split('@')[0]
+    return parsed_db_uri.geturl().replace(f':{pwd}@', ':*****@')

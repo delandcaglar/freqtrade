@@ -7,6 +7,7 @@ import pytest
 
 from freqtrade.commands import Arguments
 from freqtrade.commands.cli_options import check_int_nonzero, check_int_positive
+from tests.conftest import CURRENT_TEST_STRATEGY
 
 
 # Parse common command-line-arguments. Used for all tools
@@ -111,21 +112,21 @@ def test_parse_args_strategy_path_invalid() -> None:
 
 def test_parse_args_backtesting_invalid() -> None:
     with pytest.raises(SystemExit, match=r'2'):
-        Arguments(['backtesting --ticker-interval']).get_parsed_arg()
+        Arguments(['backtesting --timeframe']).get_parsed_arg()
 
     with pytest.raises(SystemExit, match=r'2'):
-        Arguments(['backtesting --ticker-interval', 'abc']).get_parsed_arg()
+        Arguments(['backtesting --timeframe', 'abc']).get_parsed_arg()
 
 
 def test_parse_args_backtesting_custom() -> None:
     args = [
         'backtesting',
         '-c', 'test_conf.json',
-        '--ticker-interval', '1m',
+        '--timeframe', '1m',
         '--strategy-list',
-        'DefaultStrategy',
+        CURRENT_TEST_STRATEGY,
         'SampleStrategy'
-        ]
+    ]
     call_args = Arguments(args).get_parsed_arg()
     assert call_args['config'] == ['test_conf.json']
     assert call_args['verbosity'] == 0
@@ -172,7 +173,7 @@ def test_download_data_options() -> None:
 def test_plot_dataframe_options() -> None:
     args = [
         'plot-dataframe',
-        '-c', 'config_bittrex.json.example',
+        '-c', 'config_examples/config_bittrex.example.json',
         '--indicators1', 'sma10', 'sma100',
         '--indicators2', 'macd', 'fastd', 'fastk',
         '--plot-limit', '30',
@@ -186,18 +187,22 @@ def test_plot_dataframe_options() -> None:
     assert pargs['pairs'] == ['UNITTEST/BTC']
 
 
-def test_plot_profit_options() -> None:
+@pytest.mark.parametrize('auto_open_arg', [True, False])
+def test_plot_profit_options(auto_open_arg: bool) -> None:
     args = [
         'plot-profit',
         '-p', 'UNITTEST/BTC',
         '--trade-source', 'DB',
         '--db-url', 'sqlite:///whatever.sqlite',
     ]
+    if auto_open_arg:
+        args.append('--auto-open')
     pargs = Arguments(args).get_parsed_arg()
 
     assert pargs['trade_source'] == 'DB'
     assert pargs['pairs'] == ['UNITTEST/BTC']
     assert pargs['db_url'] == 'sqlite:///whatever.sqlite'
+    assert pargs['plot_auto_open'] == auto_open_arg
 
 
 def test_config_notallowed(mocker) -> None:

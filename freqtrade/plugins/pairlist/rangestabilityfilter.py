@@ -6,9 +6,10 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import arrow
-from cachetools.ttl import TTLCache
+from cachetools import TTLCache
 from pandas import DataFrame
 
+from freqtrade.constants import ListPairsWithTimeframes
 from freqtrade.exceptions import OperationalException
 from freqtrade.misc import plural
 from freqtrade.plugins.pairlist.IPairList import IPairList
@@ -26,16 +27,18 @@ class RangeStabilityFilter(IPairList):
 
         self._days = pairlistconfig.get('lookback_days', 10)
         self._min_rate_of_change = pairlistconfig.get('min_rate_of_change', 0.01)
+        self._max_rate_of_change = pairlistconfig.get('max_rate_of_change')
         self._refresh_period = pairlistconfig.get('refresh_period', 1440)
+        self._def_candletype = self._config['candle_type_def']
 
         self._pair_cache: TTLCache = TTLCache(maxsize=1000, ttl=self._refresh_period)
 
+        candle_limit = exchange.ohlcv_candle_limit('1d', self._config['candle_type_def'])
         if self._days < 1:
             raise OperationalException("RangeStabilityFilter requires lookback_days to be >= 1")
-        if self._days > exchange.ohlcv_candle_limit('1d'):
+        if self._days > candle_limit:
             raise OperationalException("RangeStabilityFilter requires lookback_days to not "
-                                       "exceed exchange max request size "
-                                       f"({exchange.ohlcv_candle_limit('1d')})")
+                                       f"exceed exchange max request size ({candle_limit})")
 
     @property
     def needstickers(self) -> bool:
@@ -50,8 +53,12 @@ class RangeStabilityFilter(IPairList):
         """
         Short whitelist method description - used for startup-messages
         """
+        max_rate_desc = ""
+        if self._max_rate_of_change:
+            max_rate_desc = (f" and above {self._max_rate_of_change}")
         return (f"{self.name} - Filtering pairs with rate of change below "
-                f"{self._min_rate_of_change} over the last {plural(self._days, 'day')}.")
+                f"{self._min_rate_of_change}{max_rate_desc} over the "
+                f"last {plural(self._days, 'day')}.")
 
     def filter_pairlist(self, pairlist: List[str], tickers: Dict) -> List[str]:
         """
@@ -60,12 +67,13 @@ class RangeStabilityFilter(IPairList):
         :param tickers: Tickers (from exchange.get_tickers()). May be cached.
         :return: new allowlist
         """
-        needed_pairs = [(p, '1d') for p in pairlist if p not in self._pair_cache]
+        needed_pairs: ListPairsWithTimeframes = [
+            (p, '1d', self._def_candletype) for p in pairlist if p not in self._pair_cache]
 
-        since_ms = int(arrow.utcnow()
-                       .floor('day')
-                       .shift(days=-self._days - 1)
-                       .float_timestamp) * 1000
+        since_ms = (arrow.utcnow()
+                         .floor('day')
+                         .shift(days=-self._days - 1)
+                         .int_timestamp) * 1000
         # Get all candles
         candles = {}
         if needed_pairs:
@@ -74,7 +82,8 @@ class RangeStabilityFilter(IPairList):
 
         if self._enabled:
             for p in deepcopy(pairlist):
-                daily_candles = candles[(p, '1d')] if (p, '1d') in candles else None
+                daily_candles = candles[(p, '1d', self._def_candletype)] if (
+                    p, '1d', self._def_candletype) in candles else None
                 if not self._validate_pair_loc(p, daily_candles):
                     pairlist.remove(p)
         return pairlist
@@ -83,12 +92,13 @@ class RangeStabilityFilter(IPairList):
         """
         Validate trading range
         :param pair: Pair that's currently validated
-        :param ticker: ticker dict as returned from ccxt.load_markets()
+        :param daily_candles: Downloaded daily candles
         :return: True if the pair can stay, false if it should be removed
         """
         # Check symbol in cache
-        if pair in self._pair_cache:
-            return self._pair_cache[pair]
+        cached_res = self._pair_cache.get(pair, None)
+        if cached_res is not None:
+            return cached_res
 
         result = False
         if daily_candles is not None and not daily_candles.empty:
@@ -103,6 +113,17 @@ class RangeStabilityFilter(IPairList):
                               f"which is below the threshold of {self._min_rate_of_change}.",
                               logger.info)
                 result = False
+            if self._max_rate_of_change:
+                if pct_change <= self._max_rate_of_change:
+                    result = True
+                else:
+                    self.log_once(
+                        f"Removed {pair} from whitelist, because rate of change "
+                        f"over {self._days} {plural(self._days, 'day')} is {pct_change:.3f}, "
+                        f"which is above the threshold of {self._max_rate_of_change}.",
+                        logger.info)
+                    result = False
             self._pair_cache[pair] = result
-
+        else:
+            self.log_once(f"Removed {pair} from whitelist, no candles found.", logger.info)
         return result

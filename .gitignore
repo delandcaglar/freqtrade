@@ -1,6 +1,8 @@
 # Freqtrade rules
 config*.json
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 logfile.txt
 user_data/*
 !user_data/strategy/sample_strategy.py
@@ -9,6 +11,10 @@ user_data/notebooks/*
 freqtrade-plot.html
 freqtrade-profit-plot.html
 freqtrade/rpc/api_server/ui/*
+build_helpers/ta-lib/*
+
+# Macos related
+.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -75,6 +81,8 @@ instance/
 
 # Sphinx documentation
 docs/_build/
+# Mkdocs documentation
+site/
 
 # PyBuilder
 target/
@@ -95,3 +103,8 @@ target/
 
 #exceptions
 !*.gitkeep
+!config_examples/config_binance.example.json
+!config_examples/config_bittrex.example.json
+!config_examples/config_ftx.example.json
+!config_examples/config_full.example.json
+!config_examples/config_kraken.example.json

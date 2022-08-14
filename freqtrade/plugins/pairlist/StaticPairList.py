@@ -4,9 +4,9 @@ Static Pair List provider
 Provides pair white list as it configured in config
 """
 import logging
+from copy import deepcopy
 from typing import Any, Dict, List
 
-from freqtrade.exceptions import OperationalException
 from freqtrade.plugins.pairlist.IPairList import IPairList
 
 
@@ -19,10 +19,6 @@ class StaticPairList(IPairList):
                  config: Dict[str, Any], pairlistconfig: Dict[str, Any],
                  pairlist_pos: int) -> None:
         super().__init__(exchange, pairlistmanager, config, pairlistconfig, pairlist_pos)
-
-        if self._pairlist_pos != 0:
-            raise OperationalException(f"{self.name} can only be used in the first position "
-                                       "in the list of Pairlist Handlers.")
 
         self._allow_inactive = self._pairlistconfig.get('allow_inactive', False)
 
@@ -42,11 +38,10 @@ class StaticPairList(IPairList):
         """
         return f"{self.name}"
 
-    def gen_pairlist(self, cached_pairlist: List[str], tickers: Dict) -> List[str]:
+    def gen_pairlist(self, tickers: Dict) -> List[str]:
         """
         Generate the pairlist
-        :param cached_pairlist: Previously generated pairlist (cached)
-        :param tickers: Tickers (from exchange.get_tickers()).
+        :param tickers: Tickers (from exchange.get_tickers()). May be cached.
         :return: List of pairs
         """
         if self._allow_inactive:
@@ -65,4 +60,8 @@ class StaticPairList(IPairList):
         :param tickers: Tickers (from exchange.get_tickers()). May be cached.
         :return: new whitelist
         """
-        return pairlist
+        pairlist_ = deepcopy(pairlist)
+        for pair in self._config['exchange']['pair_whitelist']:
+            if pair not in pairlist_:
+                pairlist_.append(pair)
+        return pairlist_

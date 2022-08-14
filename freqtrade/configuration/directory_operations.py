@@ -15,13 +15,28 @@ def create_datadir(config: Dict[str, Any], datadir: Optional[str] = None) -> Pat
     folder = Path(datadir) if datadir else Path(f"{config['user_data_dir']}/data")
     if not datadir:
         # set datadir
-        exchange_name = config.get('exchange', {}).get('name').lower()
+        exchange_name = config.get('exchange', {}).get('name', '').lower()
         folder = folder.joinpath(exchange_name)
 
     if not folder.is_dir():
         folder.mkdir(parents=True)
         logger.info(f'Created data directory: {datadir}')
     return folder
+
+
+def chown_user_directory(directory: Path) -> None:
+    """
+    Use Sudo to change permissions of the home-directory if necessary
+    Only applies when running in docker!
+    """
+    import os
+    if os.environ.get('FT_APP_ENV') == 'docker':
+        try:
+            import subprocess
+            subprocess.check_output(
+                ['sudo', 'chown', '-R', 'ftuser:', str(directory.resolve())])
+        except Exception:
+            logger.warning(f"Could not chown {directory}")
 
 
 def create_userdata_dir(directory: str, create_dir: bool = False) -> Path:
@@ -37,6 +52,7 @@ def create_userdata_dir(directory: str, create_dir: bool = False) -> Path:
     sub_dirs = ["backtest_results", "data", "hyperopts", "hyperopt_results", "logs",
                 "notebooks", "plot", "strategies", ]
     folder = Path(directory)
+    chown_user_directory(folder)
     if not folder.is_dir():
         if create_dir:
             folder.mkdir(parents=True)
@@ -72,6 +88,5 @@ def copy_sample_files(directory: Path, overwrite: bool = False) -> None:
             if not overwrite:
                 logger.warning(f"File `{targetfile}` exists already, not deploying sample file.")
                 continue
-            else:
-                logger.warning(f"File `{targetfile}` exists already, overwriting.")
+            logger.warning(f"File `{targetfile}` exists already, overwriting.")
         shutil.copy(str(sourcedir / source), str(targetfile))

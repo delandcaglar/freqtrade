@@ -5,30 +5,55 @@ including ticker and orderbook data, live and historical candle (OHLCV) data
 Common Interface for bot and strategy to access data.
 """
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from pandas import DataFrame
 
+from freqtrade.configuration import TimeRange
 from freqtrade.constants import ListPairsWithTimeframes, PairWithTimeframe
 from freqtrade.data.history import load_pair_history
+from freqtrade.enums import CandleType, RunMode
 from freqtrade.exceptions import ExchangeError, OperationalException
-from freqtrade.exchange import Exchange
-from freqtrade.state import RunMode
+from freqtrade.exchange import Exchange, timeframe_to_seconds
+from freqtrade.util import PeriodicCache
 
 
 logger = logging.getLogger(__name__)
 
+NO_EXCHANGE_EXCEPTION = 'Exchange is not available to DataProvider.'
+MAX_DATAFRAME_CANDLES = 1000
+
 
 class DataProvider:
 
-    def __init__(self, config: dict, exchange: Exchange, pairlists=None) -> None:
+    def __init__(self, config: dict, exchange: Optional[Exchange], pairlists=None) -> None:
         self._config = config
         self._exchange = exchange
         self._pairlists = pairlists
         self.__cached_pairs: Dict[PairWithTimeframe, Tuple[DataFrame, datetime]] = {}
+        self.__slice_index: Optional[int] = None
+        self.__cached_pairs_backtesting: Dict[PairWithTimeframe, DataFrame] = {}
+        self._msg_queue: deque = deque()
 
-    def _set_cached_df(self, pair: str, timeframe: str, dataframe: DataFrame) -> None:
+        self.__msg_cache = PeriodicCache(
+            maxsize=1000, ttl=timeframe_to_seconds(self._config.get('timeframe', '1h')))
+
+    def _set_dataframe_max_index(self, limit_index: int):
+        """
+        Limit analyzed dataframe to max specified index.
+        :param limit_index: dataframe index.
+        """
+        self.__slice_index = limit_index
+
+    def _set_cached_df(
+        self,
+        pair: str,
+        timeframe: str,
+        dataframe: DataFrame,
+        candle_type: CandleType
+    ) -> None:
         """
         Store cached Dataframe.
         Using private method as this should never be used by a user
@@ -36,8 +61,10 @@ class DataProvider:
         :param pair: pair to get the data for
         :param timeframe: Timeframe to get data for
         :param dataframe: analyzed dataframe
+        :param candle_type: Any of the enum CandleType (must match trading mode!)
         """
-        self.__cached_pairs[(pair, timeframe)] = (dataframe, datetime.now(timezone.utc))
+        self.__cached_pairs[(pair, timeframe, candle_type)] = (
+            dataframe, datetime.now(timezone.utc))
 
     def add_pairlisthandler(self, pairlists) -> None:
         """
@@ -45,112 +72,87 @@ class DataProvider:
         """
         self._pairlists = pairlists
 
-    def refresh(self,
-                pairlist: ListPairsWithTimeframes,
-                helping_pairs: ListPairsWithTimeframes = None) -> None:
-        """
-        Refresh data, called with each cycle
-        """
-        if helping_pairs:
-            self._exchange.refresh_latest_ohlcv(pairlist + helping_pairs)
-        else:
-            self._exchange.refresh_latest_ohlcv(pairlist)
-
-    @property
-    def available_pairs(self) -> ListPairsWithTimeframes:
-        """
-        Return a list of tuples containing (pair, timeframe) for which data is currently cached.
-        Should be whitelist + open trades.
-        """
-        return list(self._exchange._klines.keys())
-
-    def ohlcv(self, pair: str, timeframe: str = None, copy: bool = True) -> DataFrame:
-        """
-        Get candle (OHLCV) data for the given pair as DataFrame
-        Please use the `available_pairs` method to verify which pairs are currently cached.
-        :param pair: pair to get the data for
-        :param timeframe: Timeframe to get data for
-        :param copy: copy dataframe before returning if True.
-                     Use False only for read-only operations (where the dataframe is not modified)
-        """
-        if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
-            return self._exchange.klines((pair, timeframe or self._config['timeframe']),
-                                         copy=copy)
-        else:
-            return DataFrame()
-
-    def historic_ohlcv(self, pair: str, timeframe: str = None) -> DataFrame:
+    def historic_ohlcv(
+        self,
+        pair: str,
+        timeframe: str = None,
+        candle_type: str = ''
+    ) -> DataFrame:
         """
         Get stored historical candle (OHLCV) data
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
+        :param candle_type: '', mark, index, premiumIndex, or funding_rate
         """
-        return load_pair_history(pair=pair,
-                                 timeframe=timeframe or self._config['timeframe'],
-                                 datadir=self._config['datadir'],
-                                 data_format=self._config.get('dataformat_ohlcv', 'json')
-                                 )
+        _candle_type = CandleType.from_string(
+            candle_type) if candle_type != '' else self._config['candle_type_def']
+        saved_pair = (pair, str(timeframe), _candle_type)
+        if saved_pair not in self.__cached_pairs_backtesting:
+            timerange = TimeRange.parse_timerange(None if self._config.get(
+                'timerange') is None else str(self._config.get('timerange')))
+            # Move informative start time respecting startup_candle_count
+            timerange.subtract_start(
+                timeframe_to_seconds(str(timeframe)) * self._config.get('startup_candle_count', 0)
+            )
+            self.__cached_pairs_backtesting[saved_pair] = load_pair_history(
+                pair=pair,
+                timeframe=timeframe or self._config['timeframe'],
+                datadir=self._config['datadir'],
+                timerange=timerange,
+                data_format=self._config.get('dataformat_ohlcv', 'json'),
+                candle_type=_candle_type,
 
-    def get_pair_dataframe(self, pair: str, timeframe: str = None) -> DataFrame:
+            )
+        return self.__cached_pairs_backtesting[saved_pair].copy()
+
+    def get_pair_dataframe(
+        self,
+        pair: str,
+        timeframe: str = None,
+        candle_type: str = ''
+    ) -> DataFrame:
         """
         Return pair candle (OHLCV) data, either live or cached historical -- depending
         on the runmode.
+        Only combinations in the pairlist or which have been specified as informative pairs
+        will be available.
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
         :return: Dataframe for this pair
+        :param candle_type: '', mark, index, premiumIndex, or funding_rate
         """
         if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
             # Get live OHLCV data.
-            data = self.ohlcv(pair=pair, timeframe=timeframe)
+            data = self.ohlcv(pair=pair, timeframe=timeframe, candle_type=candle_type)
         else:
             # Get historical OHLCV data (cached on disk).
-            data = self.historic_ohlcv(pair=pair, timeframe=timeframe)
+            data = self.historic_ohlcv(pair=pair, timeframe=timeframe, candle_type=candle_type)
         if len(data) == 0:
-            logger.warning(f"No data found for ({pair}, {timeframe}).")
+            logger.warning(f"No data found for ({pair}, {timeframe}, {candle_type}).")
         return data
 
     def get_analyzed_dataframe(self, pair: str, timeframe: str) -> Tuple[DataFrame, datetime]:
         """
+        Retrieve the analyzed dataframe. Returns the full dataframe in trade mode (live / dry),
+        and the last 1000 candles (up to the time evaluated at this moment) in all other modes.
         :param pair: pair to get the data for
         :param timeframe: timeframe to get data for
         :return: Tuple of (Analyzed Dataframe, lastrefreshed) for the requested pair / timeframe
             combination.
             Returns empty dataframe and Epoch 0 (1970-01-01) if no dataframe was cached.
         """
-        if (pair, timeframe) in self.__cached_pairs:
-            return self.__cached_pairs[(pair, timeframe)]
+        pair_key = (pair, timeframe, self._config.get('candle_type_def', CandleType.SPOT))
+        if pair_key in self.__cached_pairs:
+            if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
+                df, date = self.__cached_pairs[pair_key]
+            else:
+                df, date = self.__cached_pairs[pair_key]
+                if self.__slice_index is not None:
+                    max_index = self.__slice_index
+                    df = df.iloc[max(0, max_index - MAX_DATAFRAME_CANDLES):max_index]
+            return df, date
         else:
-
             return (DataFrame(), datetime.fromtimestamp(0, tz=timezone.utc))
-
-    def market(self, pair: str) -> Optional[Dict[str, Any]]:
-        """
-        Return market data for the pair
-        :param pair: Pair to get the data for
-        :return: Market data dict from ccxt or None if market info is not available for the pair
-        """
-        return self._exchange.markets.get(pair)
-
-    def ticker(self, pair: str):
-        """
-        Return last ticker data from exchange
-        :param pair: Pair to get the data for
-        :return: Ticker dict from exchange or empty dict if ticker is not available for the pair
-        """
-        try:
-            return self._exchange.fetch_ticker(pair)
-        except ExchangeError:
-            return {}
-
-    def orderbook(self, pair: str, maximum: int) -> Dict[str, List]:
-        """
-        Fetch latest l2 orderbook data
-        Warning: Does a network request - so use with common sense.
-        :param pair: pair to get the data for
-        :param maximum: Maximum number of orderbook entries to query
-        :return: dict including bids/asks with a total of `maximum` entries.
-        """
-        return self._exchange.fetch_l2_order_book(pair, maximum)
 
     @property
     def runmode(self) -> RunMode:
@@ -170,6 +172,119 @@ class DataProvider:
         """
 
         if self._pairlists:
-            return self._pairlists.whitelist
+            return self._pairlists.whitelist.copy()
         else:
             raise OperationalException("Dataprovider was not initialized with a pairlist provider.")
+
+    def clear_cache(self):
+        """
+        Clear pair dataframe cache.
+        """
+        self.__cached_pairs = {}
+        self.__cached_pairs_backtesting = {}
+        self.__slice_index = 0
+
+    # Exchange functions
+
+    def refresh(self,
+                pairlist: ListPairsWithTimeframes,
+                helping_pairs: ListPairsWithTimeframes = None) -> None:
+        """
+        Refresh data, called with each cycle
+        """
+        if self._exchange is None:
+            raise OperationalException(NO_EXCHANGE_EXCEPTION)
+        if helping_pairs:
+            self._exchange.refresh_latest_ohlcv(pairlist + helping_pairs)
+        else:
+            self._exchange.refresh_latest_ohlcv(pairlist)
+
+    @property
+    def available_pairs(self) -> ListPairsWithTimeframes:
+        """
+        Return a list of tuples containing (pair, timeframe) for which data is currently cached.
+        Should be whitelist + open trades.
+        """
+        if self._exchange is None:
+            raise OperationalException(NO_EXCHANGE_EXCEPTION)
+        return list(self._exchange._klines.keys())
+
+    def ohlcv(
+        self,
+        pair: str,
+        timeframe: str = None,
+        copy: bool = True,
+        candle_type: str = ''
+    ) -> DataFrame:
+        """
+        Get candle (OHLCV) data for the given pair as DataFrame
+        Please use the `available_pairs` method to verify which pairs are currently cached.
+        :param pair: pair to get the data for
+        :param timeframe: Timeframe to get data for
+        :param candle_type: '', mark, index, premiumIndex, or funding_rate
+        :param copy: copy dataframe before returning if True.
+                     Use False only for read-only operations (where the dataframe is not modified)
+        """
+        if self._exchange is None:
+            raise OperationalException(NO_EXCHANGE_EXCEPTION)
+        if self.runmode in (RunMode.DRY_RUN, RunMode.LIVE):
+            _candle_type = CandleType.from_string(
+                candle_type) if candle_type != '' else self._config['candle_type_def']
+            return self._exchange.klines(
+                (pair, timeframe or self._config['timeframe'], _candle_type),
+                copy=copy
+            )
+        else:
+            return DataFrame()
+
+    def market(self, pair: str) -> Optional[Dict[str, Any]]:
+        """
+        Return market data for the pair
+        :param pair: Pair to get the data for
+        :return: Market data dict from ccxt or None if market info is not available for the pair
+        """
+        if self._exchange is None:
+            raise OperationalException(NO_EXCHANGE_EXCEPTION)
+        return self._exchange.markets.get(pair)
+
+    def ticker(self, pair: str):
+        """
+        Return last ticker data from exchange
+        :param pair: Pair to get the data for
+        :return: Ticker dict from exchange or empty dict if ticker is not available for the pair
+        """
+        if self._exchange is None:
+            raise OperationalException(NO_EXCHANGE_EXCEPTION)
+        try:
+            return self._exchange.fetch_ticker(pair)
+        except ExchangeError:
+            return {}
+
+    def orderbook(self, pair: str, maximum: int) -> Dict[str, List]:
+        """
+        Fetch latest l2 orderbook data
+        Warning: Does a network request - so use with common sense.
+        :param pair: pair to get the data for
+        :param maximum: Maximum number of orderbook entries to query
+        :return: dict including bids/asks with a total of `maximum` entries.
+        """
+        if self._exchange is None:
+            raise OperationalException(NO_EXCHANGE_EXCEPTION)
+        return self._exchange.fetch_l2_order_book(pair, maximum)
+
+    def send_msg(self, message: str, *, always_send: bool = False) -> None:
+        """
+        Send custom RPC Notifications from your bot.
+        Will not send any bot in modes other than Dry-run or Live.
+        :param message: Message to be sent. Must be below 4096.
+        :param always_send: If False, will send the message only once per candle, and surpress
+                            identical messages.
+                            Careful as this can end up spaming your chat.
+                            Defaults to False
+        """
+        if self.runmode not in (RunMode.DRY_RUN, RunMode.LIVE):
+            return
+
+        if always_send or message not in self.__msg_cache:
+            self._msg_queue.append(message)
+        self.__msg_cache[message] = True

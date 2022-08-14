@@ -11,9 +11,9 @@ import sdnotify
 
 from freqtrade import __version__, constants
 from freqtrade.configuration import Configuration
+from freqtrade.enums import State
 from freqtrade.exceptions import OperationalException, TemporaryError
 from freqtrade.freqtradebot import FreqtradeBot
-from freqtrade.state import State
 
 
 logger = logging.getLogger(__name__)
@@ -61,7 +61,7 @@ class Worker:
 
     def _notify(self, message: str) -> None:
         """
-        Removes the need to verify in all occurances if sd_notify is enabled
+        Removes the need to verify in all occurrences if sd_notify is enabled
         :param message: Message to send to systemd if it's enabled.
         """
         if self._sd_notify:
@@ -85,9 +85,12 @@ class Worker:
 
         # Log state transition
         if state != old_state:
-            self.freqtrade.notify_status(f'{state.name.lower()}')
 
-            logger.info(f"Changing state to: {state.name}")
+            if old_state != State.RELOAD_CONFIG:
+                self.freqtrade.notify_status(f'{state.name.lower()}')
+
+            logger.info(
+                f"Changing state{f' from {old_state.name}' if old_state else ''} to: {state.name}")
             if state == State.RUNNING:
                 self.freqtrade.startup()
 
@@ -113,8 +116,12 @@ class Worker:
         if self._heartbeat_interval:
             now = time.time()
             if (now - self._heartbeat_msg) > self._heartbeat_interval:
+                version = __version__
+                strategy_version = self.freqtrade.strategy.version()
+                if (strategy_version is not None):
+                    version += ', strategy_version: ' + strategy_version
                 logger.info(f"Bot heartbeat. PID={getpid()}, "
-                            f"version='{__version__}', state='{state.name}'")
+                            f"version='{version}', state='{state.name}'")
                 self._heartbeat_msg = now
 
         return state
